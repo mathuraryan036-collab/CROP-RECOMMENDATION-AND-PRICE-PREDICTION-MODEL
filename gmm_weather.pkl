@@ -1,0 +1,266 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+import joblib
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI
+from pydantic import BaseModel
+from scipy.stats import mode
+from sklearn.preprocessing import StandardScaler
+
+app = FastAPI(title="Sehore Crop Recommendation + Price Prediction API")
+
+# =========================
+# LOAD DATA
+# =========================
+soil_df = pd.read_csv("FINAL SOIL DATASET _new.csv")
+weather_df = pd.read_csv("FINAL WEATHER DATASET_new.csv")
+price_history_df = pd.read_csv("filled_msp_dataset.csv")
+
+# =========================
+# LOAD MODELS
+# =========================
+kmeans_soil = joblib.load("kmeans_soil.pkl")
+kmeans_weather = joblib.load("kmeans_weather.pkl")
+gmm_soil = joblib.load("gmm_soil.pkl")
+gmm_weather = joblib.load("gmm_weather.pkl")
+price_model = joblib.load("price_model_new.joblib")
+
+# =========================
+# CROP MAP
+# =========================
+crop_map = {
+    (0, 0): ["Barley(Jau)", "Lentil(Masur)(Whole)", "Guava", "Lemon"],
+    (0, 1): [
+        "Jowar(Sorghum)",
+        "Sesamum(Sesame,Gingelly,Til)",
+        "Arhar(Tur/Red Gram)(Whole)",
+        "Black Gram(Urd Beans)(Whole)",
+        "Green Gram(Moong)(Whole)"
+    ],
+    (0, 2): [],
+    (1, 1): ["Wheat", "Mustard", "Bengal Gram(Gram)(Whole)", "Onion", "Potato"],
+    (1, 2): ["Soyabean", "Mango"],
+    (2, 2): [
+        "Maize", "Paddy(Common)", "Tomato", "Green Chilli",
+        "Marigold", "Rose", "Chrysanthemum", "Jasmine",
+        "Papaya", "Banana"
+    ]
+}
+
+# =========================
+# PREPROCESS SAME AS NOTEBOOK
+# =========================
+def convert_range(val):
+    val = str(val).strip()
+
+    if "–" in val or "-" in val:
+        val = val.replace("–", "-")
+        low, high = map(float, val.split("-"))
+        return (low + high) / 2
+    elif ">" in val:
+        num = float(val.replace(">", "").strip())
+        return num * 1.05
+    elif "<" in val:
+        num = float(val.replace("<", "").strip())
+        return num * 0.95
+    else:
+        try:
+            return float(val)
+        except:
+            return None
+
+# Soil preprocessing
+soil_train = soil_df.copy()
+for col in soil_train.columns[1:]:
+    soil_train[col] = soil_train[col].apply(convert_range)
+
+soil_train = soil_train.drop("Year", axis=1)
+
+soil_scaler = StandardScaler()
+soil_scaler.fit(soil_train)
+
+# Weather preprocessing
+weather_train = weather_df.copy()
+
+weather_train["Humidity"] = weather_train["Humidity"].astype(str).str.lower()
+weather_train["Precipitation"] = weather_train["Precipitation"].astype(str).str.lower()
+
+humidity_map = {
+    "comfortable": 1,
+    "dry": 2,
+    "humid": 3,
+    "muggy": 4,
+    "oppressive": 5,
+    "miserable": 6
+}
+
+precipitation_map = {
+    "fog": 1,
+    "haze": 2,
+    "rain": 3,
+    "heavy": 4,
+    "heavy rain/thunder": 5,
+    "thunder": 6,
+    "sleet": 7,
+    "clear": 8
+}
+
+weather_train["Humidity"] = weather_train["Humidity"].map(humidity_map)
+weather_train["Precipitation"] = weather_train["Precipitation"].map(precipitation_map)
+weather_train["Pressure"] = weather_train["Pressure"].fillna(weather_train["Pressure"].mean())
+
+weather_features_train = weather_train[["Humidity", "Precipitation", "Pressure", "Temperature", "Wind"]]
+
+weather_scaler = StandardScaler()
+weather_scaler.fit(weather_features_train)
+
+# =========================
+# INPUT SCHEMA
+# =========================
+class RecommendationInput(BaseModel):
+    n_high: float
+    n_medium: float
+    n_low: float
+    p_high: float
+    p_medium: float
+    p_low: float
+    k_high: float
+    k_medium: float
+    k_low: float
+    pH_alkaline: float
+    pH_acidic: float
+    pH_neutral: float
+
+    humidity: str
+    precipitation: str
+    pressure: float
+    temperature: float
+    wind: float
+
+    year: int
+    season: str
+
+# =========================
+# HELPER FUNCTIONS
+# =========================
+def recommend_crops(user_input: RecommendationInput):
+    soil_input = [[
+        user_input.n_high,
+        user_input.n_medium,
+        user_input.n_low,
+        user_input.p_high,
+        user_input.p_medium,
+        user_input.p_low,
+        user_input.k_high,
+        user_input.k_medium,
+        user_input.k_low,
+        user_input.pH_alkaline,
+        user_input.pH_acidic,
+        user_input.pH_neutral
+    ]]
+
+    humidity_val = humidity_map[user_input.humidity.lower()]
+    precipitation_val = precipitation_map[user_input.precipitation.lower()]
+
+    weather_input = [[
+        humidity_val,
+        precipitation_val,
+        user_input.pressure,
+        user_input.temperature,
+        user_input.wind
+    ]]
+
+    soil_scaled = soil_scaler.transform(soil_input)
+    weather_scaled = weather_scaler.transform(weather_input)
+
+    s_k = kmeans_soil.predict(soil_scaled)[0]
+    s_g = gmm_soil.predict(soil_scaled)[0]
+    w_k = kmeans_weather.predict(weather_scaled)[0]
+    w_g = gmm_weather.predict(weather_scaled)[0]
+
+    soil_cluster = int(mode([s_k, s_g], keepdims=False).mode)
+    weather_cluster = int(mode([w_k, w_g], keepdims=False).mode)
+
+    recommended = crop_map.get((soil_cluster, weather_cluster), [])
+
+    return soil_cluster, weather_cluster, recommended
+
+def get_latest_crop_features(crop_name: str, season: str, year: int):
+    df = price_history_df.copy()
+    df.columns = df.columns.str.strip()
+
+    # Try exact crop match
+    crop_rows = df[df["Crop"].astype(str).str.strip() == crop_name]
+
+    # fallback if exact not found
+    if crop_rows.empty:
+        crop_rows = df[df["Crop"].astype(str).str.contains(crop_name, case=False, na=False)]
+
+    if crop_rows.empty:
+        return None
+
+    crop_rows = crop_rows.sort_values(["Year"]).reset_index(drop=True)
+    last_row = crop_rows.iloc[-1]
+
+    return {
+        "Crop": crop_name,
+        "Year": year,
+        "Season": season,
+        "MSP": float(last_row["MSP"]),
+        "prev_price": float(last_row["prev_price"]) if "prev_price" in crop_rows.columns else float(last_row["Price"]),
+        "price_change": float(last_row["price_change"]) if "price_change" in crop_rows.columns else 0.0,
+    }
+
+def predict_prices_for_crops(crops, season, year):
+    results = []
+
+    for crop in crops:
+        features = get_latest_crop_features(crop, season, year)
+        if features is None:
+            continue
+
+        input_df = pd.DataFrame([features])
+        predicted_price = float(price_model.predict(input_df)[0])
+
+        results.append({
+            "crop": crop,
+            "predicted_price": round(predicted_price, 2),
+            "season": season,
+            "year": year,
+            "msp_used": features["MSP"],
+            "prev_price_used": features["prev_price"],
+            "price_change_used": features["price_change"]
+        })
+
+    results = sorted(results, key=lambda x: x["predicted_price"], reverse=True)
+    return results
+
+# =========================
+# API ROUTES
+# =========================
+@app.get("/")
+def home():
+    return {"message": "Sehore Crop Recommendation + Price Prediction API is running"}
+
+@app.post("/recommend")
+def recommend(input_data: RecommendationInput):
+    soil_cluster, weather_cluster, recommended_crops = recommend_crops(input_data)
+
+    price_predictions = predict_prices_for_crops(
+        recommended_crops,
+        input_data.season,
+        input_data.year
+    )
+
+    best_crop = price_predictions[0] if price_predictions else None
+
+    return {
+        "soil_cluster": soil_cluster,
+        "weather_cluster": weather_cluster,
+        "recommended_crops": recommended_crops,
+        "price_predictions": price_predictions,
+        "best_crop_by_price": best_crop,
+        "note": "This best crop is based on highest predicted selling price, not true profit. For profit, add cultivation cost data."
+    }

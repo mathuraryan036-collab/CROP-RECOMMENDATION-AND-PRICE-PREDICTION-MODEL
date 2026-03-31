@@ -1,0 +1,94 @@
+import streamlit as st
+import requests
+import pandas as pd
+
+st.set_page_config(page_title="Sehore Crop Advisor", page_icon="🌾", layout="wide")
+
+st.title("🌾 Sehore District Crop Recommendation & Price Prediction")
+st.write("Enter soil and weather details to get recommended crops and predicted selling prices.")
+
+st.subheader("Soil Inputs")
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    n_high = st.number_input("N High", value=472.5)
+    n_medium = st.number_input("N Medium", value=365.0)
+    n_low = st.number_input("N Low", value=266.0)
+    p_high = st.number_input("P High", value=25.0)
+
+with col2:
+    p_medium = st.number_input("P Medium", value=17.5)
+    p_low = st.number_input("P Low", value=9.5)
+    k_high = st.number_input("K High", value=294.0)
+    k_medium = st.number_input("K Medium", value=214.5)
+
+with col3:
+    k_low = st.number_input("K Low", value=128.25)
+    ph_alkaline = st.number_input("pH Alkaline", value=7.875)
+    ph_acidic = st.number_input("pH Acidic", value=6.175)
+    ph_neutral = st.number_input("pH Neutral", value=7.0)
+
+st.subheader("Weather Inputs")
+col4, col5 = st.columns(2)
+
+with col4:
+    humidity = st.selectbox("Humidity", ["comfortable", "dry", "humid", "muggy", "oppressive", "miserable"])
+    precipitation = st.selectbox("Precipitation", ["fog", "haze", "rain", "heavy", "heavy rain/thunder", "thunder", "sleet", "clear"])
+    pressure = st.number_input("Pressure", value=29.8)
+
+with col5:
+    temperature = st.number_input("Temperature", value=78.0)
+    wind = st.number_input("Wind", value=10.0)
+    year = st.number_input("Prediction Year", min_value=2024, max_value=2035, value=2026)
+    season = st.selectbox("Season", ["Kharif", "Rabi", "Summer", "Whole Year"])
+
+if st.button("Recommend Crop"):
+    payload = {
+        "n_high": n_high,
+        "n_medium": n_medium,
+        "n_low": n_low,
+        "p_high": p_high,
+        "p_medium": p_medium,
+        "p_low": p_low,
+        "k_high": k_high,
+        "k_medium": k_medium,
+        "k_low": k_low,
+        "pH_alkaline": ph_alkaline,
+        "pH_acidic": ph_acidic,
+        "pH_neutral": ph_neutral,
+        "humidity": humidity,
+        "precipitation": precipitation,
+        "pressure": pressure,
+        "temperature": temperature,
+        "wind": wind,
+        "year": int(year),
+        "season": season
+    }
+
+    try:
+        response = requests.post("http://127.0.0.1:8000/recommend", json=payload)
+        data = response.json()
+
+        st.success("Prediction completed")
+
+        st.write("### Clusters")
+        st.write(f"Soil Cluster: {data['soil_cluster']}")
+        st.write(f"Weather Cluster: {data['weather_cluster']}")
+
+        st.write("### Recommended Crops")
+        st.write(data["recommended_crops"])
+
+        st.write("### Price Predictions")
+        if data["price_predictions"]:
+            df = pd.DataFrame(data["price_predictions"])
+            st.dataframe(df, use_container_width=True)
+
+            st.write("### Best Crop")
+            st.json(data["best_crop_by_price"])
+        else:
+            st.warning("No matching crop price data found for the recommended crops.")
+
+        st.info(data["note"])
+
+    except Exception as e:
+        st.error(f"Error: {e}")
